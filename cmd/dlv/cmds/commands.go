@@ -9,12 +9,10 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
-	"reflect"
 	"runtime"
 	"strconv"
 	"strings"
 	"syscall"
-	"time"
 
 	"github.com/go-delve/delve/cmd/dlv/cmds/helphelpers"
 	"github.com/go-delve/delve/pkg/config"
@@ -194,6 +192,19 @@ option to let the process continue or kill it.
 		Run: connectCmd,
 	}
 	rootCommand.AddCommand(connectCommand)
+	callGraphCommand := &cobra.Command{
+		Use:   "callGraph",
+		Short: "",
+		Long:  "",
+		PersistentPreRunE: func(cmd *cobra.Command, args []string) error {
+			if len(args) == 0 {
+				return errors.New("you must provide an address as the first argument")
+			}
+			return nil
+		},
+		Run: callGraphCmd,
+	}
+	rootCommand.AddCommand(callGraphCommand)
 
 	// 'dap' subcommand.
 	dapCommand := &cobra.Command{
@@ -652,7 +663,7 @@ func traceCmd(cmd *cobra.Command, args []string, conf *config.Config) int {
 		if workingDir == "" {
 			workingDir = "."
 		}
-
+		fmt.Printf("wd %v\n", workingDir)
 		// Create and start a debug server
 		server := rpccommon.NewServer(&service.Config{
 			Listener:    listener,
@@ -686,112 +697,51 @@ func traceCmd(cmd *cobra.Command, args []string, conf *config.Config) int {
 			fmt.Fprintln(os.Stderr, err)
 			return 1
 		}
-		success := false
-		for i := range funcs {
-			if traceUseEBPF {
-				err := client.CreateEBPFTracepoint(funcs[i])
-				if err != nil {
-					fmt.Fprintf(os.Stderr, "unable to set tracepoint on function %s: %#v\n", funcs[i], err)
-				} else {
-					success = true
-				}
-			} else {
-				// Fall back to breakpoint based tracing if we get an error.
-				_, err = client.CreateBreakpoint(&api.Breakpoint{
-					FunctionName: funcs[i],
-					Tracepoint:   true,
-					Line:         -1,
-					Stacktrace:   traceStackDepth,
-					LoadArgs:     &terminal.ShortLoadConfig,
-				})
-				if err != nil && !isBreakpointExistsErr(err) {
-					fmt.Fprintf(os.Stderr, "unable to set tracepoint on function %s: %#v\n", funcs[i], err)
-					continue
-				} else {
-					success = true
-				}
-				addrs, err := client.FunctionReturnLocations(funcs[i])
-				if err != nil {
-					fmt.Fprintf(os.Stderr, "unable to set tracepoint on function %s: %#v\n", funcs[i], err)
-					continue
-				}
-				for i := range addrs {
-					_, err = client.CreateBreakpoint(&api.Breakpoint{
-						Addr:        addrs[i],
-						TraceReturn: true,
-						Stacktrace:  traceStackDepth,
-						Line:        -1,
-						LoadArgs:    &terminal.ShortLoadConfig,
-					})
-					if err != nil && !isBreakpointExistsErr(err) {
-						fmt.Fprintf(os.Stderr, "unable to set tracepoint on function %s: %#v\n", funcs[i], err)
-					} else {
-						success = true
-					}
-				}
-			}
-		}
-		if !success {
-			fmt.Fprintln(os.Stderr, "no breakpoints set")
+		fmt.Printf("get %d funcs\n", len(funcs))
+
+		_, err = client.CreateBreakpoint(&api.Breakpoint{
+			FunctionName: "main.main",
+			Tracepoint:   true,
+			Line:         -1,
+			Stacktrace:   traceStackDepth,
+			LoadArgs:     &terminal.ShortLoadConfig,
+		})
+
+		if err != nil && !isBreakpointExistsErr(err) {
+			fmt.Fprintf(os.Stderr, "unable to set tracepoint on function main.main\n")
 			return 1
 		}
 		cmds := terminal.DebugCommands(client)
+		_ = cmds
 		cfg := &config.Config{
 			TraceShowTimestamp: traceShowTimestamp,
 		}
 		t := terminal.New(client, cfg)
-		t.SetTraceNonInteractive()
+		// t.SetTraceNonInteractive()
 		t.RedirectTo(os.Stderr)
 		defer t.Close()
-		if traceUseEBPF {
-			done := make(chan struct{})
-			defer close(done)
-			go func() {
-				for {
-					select {
-					case <-done:
-						return
-					default:
-						tracepoints, err := client.GetBufferedTracepoints()
-						if err != nil {
-							panic(err)
-						}
-						for _, t := range tracepoints {
-							var params strings.Builder
-							for _, p := range t.InputParams {
-								if params.Len() > 0 {
-									params.WriteString(", ")
-								}
-								if p.Kind == reflect.String {
-									params.WriteString(fmt.Sprintf("%q", p.Value))
-								} else {
-									params.WriteString(p.Value)
-								}
-							}
-
-							if traceShowTimestamp {
-								fmt.Fprintf(os.Stderr, "%s ", time.Now().Format(time.RFC3339Nano))
-							}
-
-							if t.IsRet {
-								for _, p := range t.ReturnParams {
-									fmt.Fprintf(os.Stderr, "=> %#v\n", p.Value)
-								}
-							} else {
-								fmt.Fprintf(os.Stderr, "> (%d) %s(%s)\n", t.GoroutineID, t.FunctionName, params.String())
-							}
-						}
-					}
-				}
-			}()
-		}
-		err = cmds.Call("continue", t)
+		cmds.Call("list", t)
+		cmds.Call("b main.main", t)
+		cmds.Call("bp", t)
+		cmds.Call("c", t)
+		cmds.Call("list", t)
+		// ss, err := client.ListSources("")
+		// if err != nil {
+		// 	fmt.Println(err)
+		// 	return 1
+		// }
+		// for _, s := range ss {
+		// 	fmt.Printf("%s\n", s)
+		// }
+		// cmds.Call("continue", t)
 		if err != nil {
 			fmt.Fprintln(os.Stderr, err)
 			if !strings.Contains(err.Error(), "exited") {
 				return 1
 			}
 		}
+		client.GetState()
+		fmt.Printf("--over-\n")
 		return 0
 	}()
 	return status
@@ -876,6 +826,26 @@ func connectCmd(_ *cobra.Command, args []string) {
 	os.Exit(ec)
 }
 
+func callGraphCmd(_ *cobra.Command, args []string) {
+	if err := logflags.Setup(log, logOutput, logDest); err != nil {
+		fmt.Fprintf(os.Stderr, "%v\n", err)
+		os.Exit(1)
+		return
+	}
+	if loadConfErr != nil {
+		logflags.DebuggerLogger().Errorf("%v", loadConfErr)
+	}
+	addr := args[0]
+	if addr == "" {
+		fmt.Fprint(os.Stderr, "An empty address was provided. You must provide an address as the first argument.\n")
+		logflags.Close()
+		os.Exit(1)
+	}
+	ec := callGraph(addr, conf)
+	logflags.Close()
+	os.Exit(ec)
+}
+
 // waitForDisconnectSignal is a blocking function that waits for either
 // a SIGINT (Ctrl-C) or SIGTERM (kill -15) OS signal or for disconnectChan
 // to be closed by the server when the client disconnects.
@@ -938,6 +908,71 @@ func connect(addr string, clientConn net.Conn, conf *config.Config) int {
 		fmt.Println(err)
 	}
 	return status
+}
+
+type CliExt struct {
+	*rpc2.RPCClient
+}
+
+func (c *CliExt) GetCurrentLines() (file string, line int, fun string, err error) {
+	state, err := c.GetState()
+	if err != nil {
+		return "", 0, "", err
+	}
+	cr := state.SelectedGoroutine.CurrentLoc
+	return cr.File, cr.Line, cr.Function.Name(), nil
+}
+
+func callGraph(addr string, conf *config.Config) int {
+	client := rpc2.NewClient(addr)
+	c := CliExt{client}
+	cmds := terminal.DebugCommands(client)
+	t := terminal.New(client, conf)
+	t.SetTraceNonInteractive()
+	cmds.Call("clearall", t)
+	cmds.Call("r", t)
+	fs, err := c.ListFunctions("k8s.io")
+	if err != nil {
+		return 0
+	}
+	for _, f := range fs {
+		fmt.Println(f)
+	}
+	cmds.Call("b k8s.io/kubectl/pkg/cmd/get.Run", t)
+	cmds.Call("bp", t)
+	cmds.Call("c", t) // in main.main
+	file, line, fun, err := c.GetCurrentLines()
+	if err != nil {
+		fmt.Println(err)
+		return 1
+	}
+	fmt.Printf("file %v line %v func %v\n", file, line, fun)
+	count := 0
+	for {
+		count++
+		_, err := c.Step()
+		if err != nil {
+			fmt.Printf("err %v", err)
+			break
+		}
+		c.GetState()
+		file, line, fun, err := c.GetCurrentLines()
+		if err != nil {
+			fmt.Println(err)
+			return 1
+		}
+		fmt.Printf("count %d file %v line %v func %v\n", count, file, line, fun)
+		if strings.HasPrefix(file, "/usr/lib/go") {
+			c.StepOut()
+		}
+		excludes := []string{"imdario", "reflect", "sigs.k8s.io/json"}
+		for _, e := range excludes {
+			if strings.Contains(file, e) {
+				c.StepOut()
+			}
+		}
+	}
+	return 0
 }
 
 func execute(attachPid int, processArgs []string, conf *config.Config, coreFile string, kind debugger.ExecuteKind, dlvArgs []string, buildFlags string) int {
